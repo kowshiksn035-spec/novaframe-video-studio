@@ -1,0 +1,47 @@
+'use strict';
+const $ = s => document.querySelector(s), $$ = s => [...document.querySelectorAll(s)];
+let mode='text', motion='Dolly In', user=null, config={}, busy=false, activeId=null, timer=null, previewURL=null, uploadedPath=null, pendingRequest=null;
+const terminal = new Set(['completed','failed','cancelled','needs_review']);
+function toast(message){$('#toast').textContent=message;$('#toast').classList.add('show');clearTimeout(toast.timer);toast.timer=setTimeout(()=>$('#toast').classList.remove('show'),5000);}
+async function api(path, options={}, retry=true){
+ const headers={...options.headers};if(options.body && !(options.body instanceof FormData))headers['Content-Type']='application/json';
+ const response=await fetch('/api'+path,{...options,headers,credentials:'same-origin'});
+ if(response.status===401 && retry && !path.startsWith('/auth/')){const refresh=await fetch('/api/auth/refresh',{method:'POST'});if(refresh.ok)return api(path,options,false);user=null;sync();}
+ const data=await response.json();if(!response.ok){const error=new Error(data.error||'Something went wrong. Please try again.');error.status=response.status;throw error;}return data;
+}
+function sync(){ $('#generateButton').disabled=busy||!config.generation_ready;$('#generateButton').textContent=busy?'Submitting…':'✦ Generate video';$('#accountButton').textContent=user?'Sign out':'Sign in';$('#accountLabel').textContent=user?.email||'Your personal creative space';}
+function view(name){$$('.view').forEach(v=>v.classList.toggle('active-view',v.id===name+'View'));$$('.nav-item').forEach(b=>b.classList.toggle('active',b.dataset.view===name));if(name==='history')loadHistory();}
+$$('.nav-item').forEach(b=>b.onclick=()=>view(b.dataset.view));
+function setMode(next){mode=next;$$('.tab').forEach(t=>{const selected=t.dataset.mode===mode;t.classList.toggle('active',selected);t.setAttribute('aria-pressed',selected);});$('#imageDrop').classList.toggle('hidden',mode!=='image');$('#ratio').disabled=mode==='image';$('#ratioHint').classList.toggle('hidden',mode!=='image');}
+$$('.tab').forEach(b=>b.onclick=()=>setMode(b.dataset.mode));
+function count(){$('#promptCount').textContent=$('#prompt').value.length;}
+$('#prompt').oninput=count;count();
+$('#enhancePrompt').onclick=()=>{const p=$('#prompt');if(!p.value.trim())return toast('Describe a scene first.');const detail=', cinematic lighting, coherent motion, natural physics, realistic texture detail';if(!p.value.includes('natural physics'))p.value=(p.value+detail).slice(0,1200);count();};
+function setMotion(value){motion=value;$$('.motion-chip').forEach(b=>{b.classList.toggle('selected',b.dataset.motion===value);b.setAttribute('aria-pressed',b.dataset.motion===value);});}
+$$('.motion-chip').forEach(b=>b.onclick=()=>setMotion(b.dataset.motion));$('#clearMotion').onclick=()=>setMotion('');
+$('#imageDropButton').onclick=()=>$('#imageInput').click();
+$('#imageInput').onchange=()=>{const file=$('#imageInput').files[0];if(!file)return;if(file.size>3.9*1024*1024||!['image/png','image/jpeg','image/webp'].includes(file.type)){$('#imageInput').value='';return toast('Use PNG, JPG or WEBP under 4 MB.');}if(previewURL)URL.revokeObjectURL(previewURL);previewURL=URL.createObjectURL(file);uploadedPath=null;$('#imagePreview').src=previewURL;$('#imagePreview').classList.remove('hidden');$('#imageDropButton').classList.add('hidden');$('#removeImage').classList.remove('hidden');};
+$('#removeImage').onclick=()=>{if(previewURL)URL.revokeObjectURL(previewURL);previewURL=null;uploadedPath=null;$('#imageInput').value='';$('#imagePreview').removeAttribute('src');$('#imagePreview').classList.add('hidden');$('#imageDropButton').classList.remove('hidden');$('#removeImage').classList.add('hidden');};
+function preview(which){['emptyPreview','generatingPreview','donePreview'].forEach(id=>$('#'+id).classList.toggle('hidden',id!==which));}
+function showJob(job){activeId=job.id;$('#previewStatus').textContent=job.status.replaceAll('_',' ');if(job.status==='completed'&&job.video_url){preview('donePreview');$('#resultVideo').src=job.video_url;$('#downloadVideo').href=job.video_url;}else{preview('generatingPreview');$('#generationHeading').textContent=terminal.has(job.status)?'Generation update':'Creating your video';$('#generationStatus').textContent=job.error||(job.status==='submitting'?'Confirming submission. If this persists, contact the studio owner.':job.status==='processing'?'Rendering your scene…':'Waiting in the queue…');$('.loader-ring').classList.toggle('hidden',terminal.has(job.status));} }
+async function poll(){if(!activeId)return;clearTimeout(timer);try{const row=await api('/generations/'+activeId);showJob(row);if(!terminal.has(row.status)&&row.status!=='submitting')timer=setTimeout(poll,8000);}catch(e){toast(e.message);$('#generationStatus').textContent='Could not refresh. Use Check status to try again.';}}
+$('#checkStatus').onclick=poll;
+async function generate(){
+ if(!user){$('#authDialog').showModal();return;}if(busy)return;
+ const prompt=$('#prompt').value.trim();if(prompt.length<10)return toast('Write a prompt with at least 10 characters.');if(mode==='image'&&!$('#imageInput').files[0])return toast('Add a starting frame.');busy=true;sync();
+ try{if(mode==='image'&&!uploadedPath){const body=new FormData();body.append('image',$('#imageInput').files[0]);uploadedPath=(await api('/uploads',{method:'POST',body})).path;}
+ const settings={prompt,mode,duration:Number($('#duration').value),ratio:$('#ratio').value,motion,image_path:mode==='image'?uploadedPath:null};
+ // Retain the same ID after an ambiguous network failure, even across reloads.
+ let stored;try{stored=JSON.parse(sessionStorage.getItem('nf_pending')||'null');}catch{}
+ if(stored&&stored.email===user.email){pendingRequest=stored.request;if(JSON.stringify(pendingRequest.settings)!==JSON.stringify(settings))throw new Error('A previous submission needs confirmation. Open Generations before starting another.');}
+ if(!pendingRequest)pendingRequest={id:crypto.randomUUID(),settings};sessionStorage.setItem('nf_pending',JSON.stringify({email:user.email,request:pendingRequest}));
+ const row=await api('/generations',{method:'POST',body:JSON.stringify({id:pendingRequest.id,...pendingRequest.settings})});pendingRequest=null;sessionStorage.removeItem('nf_pending');showJob(row);clearTimeout(timer);if(!terminal.has(row.status))timer=setTimeout(poll,5000);
+ }catch(e){if([400,403,429].includes(e.status)){pendingRequest=null;sessionStorage.removeItem('nf_pending');}toast(e.message);}finally{busy=false;sync();}
+}
+$('#generateButton').onclick=generate;$('#regenerate').onclick=()=>{preview('emptyPreview');$('#prompt').focus();};
+async function loadHistory(){const grid=$('#historyGrid');grid.replaceChildren();const empty=document.createElement('p');empty.className='muted';empty.textContent=user?'Loading your generations…':'Sign in to see your generations.';grid.append(empty);if(!user)return;try{const rows=await api('/generations');grid.replaceChildren();if(!rows.length){empty.textContent='Your story starts with your first generation.';grid.append(empty);}for(const row of rows){const card=document.createElement('article');card.className='history-card';const text=document.createElement('div');text.className='history-copy';const title=document.createElement('strong');title.textContent=row.settings.prompt;const meta=document.createElement('span');meta.textContent=`${row.settings.duration}s · ${row.status.replaceAll('_',' ')} · ${new Date(row.created_at).toLocaleDateString()}`;const button=document.createElement('button');button.className='ghost-btn';button.textContent='Open generation';button.onclick=()=>{view('create');showJob(row);poll();};text.append(title,meta,button);card.append(text);grid.append(card);}let pending;try{pending=JSON.parse(sessionStorage.getItem('nf_pending')||'null');}catch{}if(pending?.email===user.email&&rows.some(r=>r.id===pending.request.id)){sessionStorage.removeItem('nf_pending');pendingRequest=null;}}catch(e){empty.textContent=e.message;grid.replaceChildren(empty);}}
+$('#refreshHistory').onclick=loadHistory;
+$('#accountButton').onclick=async()=>{if(!user){if(!config.auth_ready)return toast('Sign-in is waiting for studio setup.');$('#authDialog').showModal();return;}try{await api('/auth/logout',{method:'POST'});user=null;activeId=null;pendingRequest=null;clearTimeout(timer);$('#resultVideo').removeAttribute('src');preview('emptyPreview');$('#historyGrid').replaceChildren();sync();}catch(e){toast(e.message);}};
+$('#closeAuth').onclick=()=>$('#authDialog').close();
+$('#authForm').onsubmit=async e=>{e.preventDefault();$('#loginButton').disabled=true;$('#authError').textContent='';try{await api('/auth/login',{method:'POST',body:JSON.stringify({email:$('#email').value,password:$('#password').value})});user=await api('/me');$('#password').value='';$('#authDialog').close();sync();toast('Welcome to your studio.');}catch(e){$('#authError').textContent=e.message;}finally{$('#loginButton').disabled=false;}};
+(async()=>{try{config=await api('/config');$('#setupNotice').textContent=config.generation_ready?'Private beta · Your generations are saved to your account.':'Studio preview · Live generation is waiting for account setup.';if(config.auth_ready){try{user=await api('/me');}catch{}}sync();}catch(e){$('#setupNotice').textContent=e.message;}})();
