@@ -72,7 +72,7 @@ python -m pytest -q
 node --check public/app.js
 ```
 
-GitHub Actions also runs these checks automatically from `.github/workflows/verify.yml`.
+GitHub Actions also runs these checks automatically from `.github/workflows/verify.yml`; continuation changes should pass this workflow before merging.
 
 ## Operational limitations
 
