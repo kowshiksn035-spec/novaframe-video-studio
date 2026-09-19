@@ -29,6 +29,16 @@ def test_health_ready(client,monkeypatch):
  for key,value in {'SUPABASE_URL':'https://example.supabase.co','SUPABASE_ANON_KEY':'anon','SUPABASE_SERVICE_ROLE_KEY':'service','ALLOWED_EMAILS':'creator@example.com','HF_KEY':'test:secret'}.items():monkeypatch.setenv(key,value)
  monkeypatch.setattr(m,'sb',lambda *a,**k:[])
  r=client.get('/api/health');assert r.status_code==200;assert r.json['status']=='ready';assert r.json['supabase_reachable'] is True
+
+def test_health_rejects_malformed_provider_key(client,monkeypatch):
+ for key,value in {'SUPABASE_URL':'https://example.supabase.co','SUPABASE_ANON_KEY':'anon','SUPABASE_SERVICE_ROLE_KEY':'service','ALLOWED_EMAILS':'creator@example.com','HF_KEY':'not-a-paired-key'}.items():monkeypatch.setenv(key,value)
+ monkeypatch.setattr(m,'sb',lambda *a,**k:[])
+ r=client.get('/api/health');assert r.status_code==200;assert r.json['status']=='setup_required';assert r.json['provider_configured'] is False
+
+def test_health_degraded_when_supabase_unreachable(client,monkeypatch):
+ for key,value in {'SUPABASE_URL':'https://example.supabase.co','SUPABASE_ANON_KEY':'anon','SUPABASE_SERVICE_ROLE_KEY':'service','ALLOWED_EMAILS':'creator@example.com','HF_KEY':'test:secret'}.items():monkeypatch.setenv(key,value)
+ monkeypatch.setattr(m,'sb',lambda *a,**k:(_ for _ in ()).throw(m.Problem('db down',502)))
+ r=client.get('/api/health');assert r.status_code==503;assert r.json['status']=='degraded';assert r.json['supabase_reachable'] is False
 @pytest.mark.parametrize('changes',[{'duration':True},{'duration':300},{'prompt':'short'},{'ratio':'bad'},{'mode':'image','image_path':'other/file.jpg'}])
 def test_validation(client,monkeypatch,changes):
  auth(monkeypatch,lambda *a,**k:pytest.fail('Invalid request reached DB'));assert post(client,payload(**changes)).status_code==400
