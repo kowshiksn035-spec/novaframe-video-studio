@@ -193,6 +193,18 @@ def update_job(job_id, **values):
 def history():
     return jsonify(sb('GET', '/rest/v1/generations', params={'user_id':'eq.' + g.user, 'select':'*', 'order':'created_at.desc', 'limit':'100'}))
 
+@app.get('/api/generations/active')
+@signed_in
+def active_generation():
+    rows = sb('GET', '/rest/v1/generations', params={
+        'user_id':'eq.' + g.user,
+        'status':'in.(submitting,queued,processing)',
+        'select':'*',
+        'order':'created_at.desc',
+        'limit':'1',
+    })
+    return jsonify(rows[0] if rows else None)
+
 def submit_provider(model_id, mode, arguments):
     model = SUPPORTED_MODELS[model_id]
     application = model['applications'][mode]

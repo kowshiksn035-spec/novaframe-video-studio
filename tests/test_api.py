@@ -52,6 +52,15 @@ def test_owner_scope(client,monkeypatch):
  def handler(method,path,**kw):
   assert kw['params']['user_id']=='eq.'+UID;return []
  auth(monkeypatch,handler);assert client.get('/api/generations').json==[]
+
+def test_active_generation_is_owner_scoped(client,monkeypatch):
+ job={'id':str(uuid.uuid4()),'status':'queued','provider_id':'p1'}
+ def handler(method,path,**kw):
+  params=kw['params'];assert params['user_id']=='eq.'+UID;assert params['status']=='in.(submitting,queued,processing)';assert params['limit']=='1';return [job]
+ auth(monkeypatch,handler);assert client.get('/api/generations/active').json==job
+
+def test_active_generation_returns_null_when_idle(client,monkeypatch):
+ auth(monkeypatch,lambda *a,**k:[]);assert client.get('/api/generations/active').json is None
 def test_duplicate(client,monkeypatch):
  data=payload();settings={k:v for k,v in data.items() if k!='id'};settings['model']='kling-3-standard';settings['image_path']=None
  auth(monkeypatch,lambda *a,**k:{'created':False,'job':{'id':data['id'],'settings':settings,'status':'queued'}})
