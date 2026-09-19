@@ -21,6 +21,11 @@ def test_anonymous(client):
 def test_unconfigured(client,monkeypatch):
  monkeypatch.delenv('SUPABASE_URL',raising=False);assert client.get('/api/config').json['generation_ready'] is False
 
+def test_config_exposes_model_registry(client):
+ config=client.get('/api/config').json
+ assert config['default_model']=='kling-3-standard'
+ assert config['models']==[{'id':'kling-3-standard','label':'Kling 3.0 Standard'}]
+
 def test_health_setup_required(client,monkeypatch):
  monkeypatch.delenv('SUPABASE_URL',raising=False)
  r=client.get('/api/health');assert r.status_code==200;assert r.json['status']=='setup_required';assert r.json['ok'] is False
@@ -39,7 +44,7 @@ def test_health_degraded_when_supabase_unreachable(client,monkeypatch):
  for key,value in {'SUPABASE_URL':'https://example.supabase.co','SUPABASE_ANON_KEY':'anon','SUPABASE_SERVICE_ROLE_KEY':'service','ALLOWED_EMAILS':'creator@example.com','HF_KEY':'test:secret'}.items():monkeypatch.setenv(key,value)
  monkeypatch.setattr(m,'sb',lambda *a,**k:(_ for _ in ()).throw(m.Problem('db down',502)))
  r=client.get('/api/health');assert r.status_code==503;assert r.json['status']=='degraded';assert r.json['supabase_reachable'] is False
-@pytest.mark.parametrize('changes',[{'duration':True},{'duration':300},{'prompt':'short'},{'ratio':'bad'},{'mode':'image','image_path':'other/file.jpg'}])
+@pytest.mark.parametrize('changes',[{'duration':True},{'duration':300},{'prompt':'short'},{'ratio':'bad'},{'model':'unknown-model'},{'mode':'image','image_path':'other/file.jpg'}])
 def test_validation(client,monkeypatch,changes):
  auth(monkeypatch,lambda *a,**k:pytest.fail('Invalid request reached DB'));assert post(client,payload(**changes)).status_code==400
 
@@ -48,7 +53,7 @@ def test_owner_scope(client,monkeypatch):
   assert kw['params']['user_id']=='eq.'+UID;return []
  auth(monkeypatch,handler);assert client.get('/api/generations').json==[]
 def test_duplicate(client,monkeypatch):
- data=payload();settings={k:v for k,v in data.items() if k!='id'};settings['image_path']=None
+ data=payload();settings={k:v for k,v in data.items() if k!='id'};settings['model']='kling-3-standard';settings['image_path']=None
  auth(monkeypatch,lambda *a,**k:{'created':False,'job':{'id':data['id'],'settings':settings,'status':'queued'}})
  monkeypatch.setattr(m,'submit_provider',lambda *a,**k:pytest.fail('Duplicate provider call'));assert post(client,data).status_code==200
 
@@ -60,8 +65,8 @@ def test_submit(client,monkeypatch):
   if 'reserve' in path:return {'created':True}
   assert kw['json']=={'provider_id':'p1','status':'queued'};return [{'id':'job',**kw['json']}]
  auth(monkeypatch,handler)
- def submit(model,arguments):
-  assert model=='text';assert arguments['duration']==5;return 'p1'
+ def submit(model_id,mode,arguments):
+  assert model_id=='kling-3-standard';assert mode=='text';assert arguments['duration']==5;return 'p1'
  monkeypatch.setattr(m,'submit_provider',submit);assert post(client,payload()).json['provider_id']=='p1'
 
 def test_ambiguous_submit(client,monkeypatch):
@@ -108,7 +113,7 @@ def test_provider_wire_contract(monkeypatch):
  def fake(url,**kw):
   calls.append((url,kw));return SimpleNamespace(raise_for_status=lambda:None,json=lambda:{'request_id':'provider-1'})
  monkeypatch.setattr(m.httpx,'post',fake)
- assert m.submit_provider('image',{'image_url':'https://example.com/input.jpg'})=='provider-1'
+ assert m.submit_provider('kling-3-standard','image',{'image_url':'https://example.com/input.jpg'})=='provider-1'
  assert calls[0][0]=='https://api.higgsfield.ai/kling-video/v3.0/std/image-to-video'
  assert calls[0][1]['headers']['Authorization']=='Key test:secret'
  assert len(calls)==1

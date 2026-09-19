@@ -13,6 +13,16 @@ ROOT = Path(__file__).resolve().parents[1]
 app = Flask(__name__, static_folder=str(ROOT / 'public'), static_url_path='')
 app.config['MAX_CONTENT_LENGTH'] = 4 * 1024 * 1024
 TERMINAL = {'completed', 'failed', 'cancelled', 'needs_review'}
+DEFAULT_MODEL = 'kling-3-standard'
+SUPPORTED_MODELS = {
+    DEFAULT_MODEL: {
+        'label': 'Kling 3.0 Standard',
+        'applications': {
+            'text': 'kling-video/v3.0/std/text-to-video',
+            'image': 'kling-video/v3.0/std/image-to-video',
+        },
+    },
+}
 
 class Problem(Exception):
     def __init__(self, message, status=400): self.message, self.status = message, status
@@ -92,7 +102,10 @@ def config():
     auth_ready, provider_configured, generation_ready = readiness()
     return jsonify(auth_ready=auth_ready, generation_ready=generation_ready,
                    provider_configured=provider_configured,
-                   model='Kling 3.0 Standard', payments=False)
+                   model=SUPPORTED_MODELS[DEFAULT_MODEL]['label'],
+                   default_model=DEFAULT_MODEL,
+                   models=[{'id': model_id, 'label': item['label']} for model_id, item in SUPPORTED_MODELS.items()],
+                   payments=False)
 
 @app.get('/api/health')
 def health():
@@ -180,8 +193,10 @@ def update_job(job_id, **values):
 def history():
     return jsonify(sb('GET', '/rest/v1/generations', params={'user_id':'eq.' + g.user, 'select':'*', 'order':'created_at.desc', 'limit':'100'}))
 
-def submit_provider(mode, arguments):
-    endpoint = 'https://api.higgsfield.ai/kling-video/v3.0/std/' + ('image-to-video' if mode == 'image' else 'text-to-video')
+def submit_provider(model_id, mode, arguments):
+    model = SUPPORTED_MODELS[model_id]
+    application = model['applications'][mode]
+    endpoint = 'https://api.higgsfield.ai/' + application
     # httpx does not retry requests by default. No SDK retry wrapper for POST.
     response = httpx.post(endpoint, headers={'Authorization':'Key ' + env('HF_KEY')}, json=arguments, timeout=20)
     response.raise_for_status()
@@ -195,15 +210,16 @@ def generate():
     prompt = data.get('prompt', '')
     if not isinstance(prompt, str) or not 10 <= len(prompt.strip()) <= 1200: raise Problem('Write a prompt between 10 and 1,200 characters.')
     mode = data.get('mode', 'text')
+    model_id = data.get('model', DEFAULT_MODEL)
     duration, ratio, motion = data.get('duration', 5), data.get('ratio', '16:9'), data.get('motion', '')
-    if mode not in ['text', 'image'] or type(duration) is not int or duration not in [5,10] or ratio not in ['16:9','9:16','1:1'] or motion not in ['', 'Dolly In', 'Orbit', 'FPV', 'Pan Left', 'Zoom Out', 'Static']:
+    if model_id not in SUPPORTED_MODELS or mode not in ['text', 'image'] or type(duration) is not int or duration not in [5,10] or ratio not in ['16:9','9:16','1:1'] or motion not in ['', 'Dolly In', 'Orbit', 'FPV', 'Pan Left', 'Zoom Out', 'Static']:
         raise Problem('Unsupported generation settings.')
     image_path = data.get('image_path')
     if mode == 'image':
         if not isinstance(image_path, str) or not image_path.startswith(g.user + '/') or '..' in image_path or len(image_path.split('/')) != 2:
             raise Problem('Upload a reference image first.')
     job_id = uuid_string(data.get('id'))
-    settings = dict(prompt=prompt.strip(), mode=mode, duration=duration, ratio=ratio, motion=motion, image_path=image_path if mode == 'image' else None)
+    settings = dict(prompt=prompt.strip(), model=model_id, mode=mode, duration=duration, ratio=ratio, motion=motion, image_path=image_path if mode == 'image' else None)
     reserved = sb('POST', '/rest/v1/rpc/reserve_generation', json={'p_id':job_id, 'p_user':g.user, 'p_settings':settings})
     if reserved.get('error'): raise Problem(reserved['error'], 429)
     if not reserved['created']:
@@ -216,7 +232,7 @@ def generate():
             args['image_url'] = env('SUPABASE_URL') + '/storage/v1' + signed['signedURL']
         else: args['aspect_ratio'] = ratio
         # Submit exactly once; never blindly retry a possibly accepted billable request.
-        provider_id = submit_provider(mode, args)
+        provider_id = submit_provider(model_id, mode, args)
         row = update_job(job_id, provider_id=provider_id, status='queued')
     except Exception:
         # A timeout can occur after upstream accepted the job. Keep the reservation.
