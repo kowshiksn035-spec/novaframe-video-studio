@@ -20,6 +20,15 @@ def test_anonymous(client):
  client.delete_cookie('nf_access',path='/api');assert client.get('/api/generations').status_code==401
 def test_unconfigured(client,monkeypatch):
  monkeypatch.delenv('SUPABASE_URL',raising=False);assert client.get('/api/config').json['generation_ready'] is False
+
+def test_health_setup_required(client,monkeypatch):
+ monkeypatch.delenv('SUPABASE_URL',raising=False)
+ r=client.get('/api/health');assert r.status_code==200;assert r.json['status']=='setup_required';assert r.json['ok'] is False
+
+def test_health_ready(client,monkeypatch):
+ for key,value in {'SUPABASE_URL':'https://example.supabase.co','SUPABASE_ANON_KEY':'anon','SUPABASE_SERVICE_ROLE_KEY':'service','ALLOWED_EMAILS':'creator@example.com','HF_KEY':'test:secret'}.items():monkeypatch.setenv(key,value)
+ monkeypatch.setattr(m,'sb',lambda *a,**k:[])
+ r=client.get('/api/health');assert r.status_code==200;assert r.json['status']=='ready';assert r.json['supabase_reachable'] is True
 @pytest.mark.parametrize('changes',[{'duration':True},{'duration':300},{'prompt':'short'},{'ratio':'bad'},{'mode':'image','image_path':'other/file.jpg'}])
 def test_validation(client,monkeypatch,changes):
  auth(monkeypatch,lambda *a,**k:pytest.fail('Invalid request reached DB'));assert post(client,payload(**changes)).status_code==400
