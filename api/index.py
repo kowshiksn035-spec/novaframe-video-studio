@@ -25,14 +25,18 @@ def env(name):
 def readiness():
     auth_keys = ['SUPABASE_URL', 'SUPABASE_ANON_KEY', 'SUPABASE_SERVICE_ROLE_KEY', 'ALLOWED_EMAILS']
     auth_ready = all(os.getenv(name) for name in auth_keys)
-    provider_configured = bool(os.getenv('HF_KEY'))
+    hf_key = os.getenv('HF_KEY', '')
+    provider_configured = ':' in hf_key and all(hf_key.split(':', 1))
     return auth_ready, provider_configured, auth_ready and provider_configured
 
 def sb(method, path, *, admin=True, token=None, **kwargs):
     key = env('SUPABASE_SERVICE_ROLE_KEY' if admin else 'SUPABASE_ANON_KEY')
     headers = {'apikey': key, 'Authorization': 'Bearer ' + (token or key)}
     headers.update(kwargs.pop('headers', {}))
-    r = httpx.request(method, env('SUPABASE_URL').rstrip('/') + path, headers=headers, timeout=20, **kwargs)
+    try:
+        r = httpx.request(method, env('SUPABASE_URL').rstrip('/') + path, headers=headers, timeout=20, **kwargs)
+    except httpx.RequestError:
+        raise Problem('The data service could not complete this request.', 502)
     if r.is_error:
         if r.status_code == 401: raise Problem('Please sign in again.', 401)
         raise Problem('The data service could not complete this request.', 502)
