@@ -22,11 +22,21 @@ def env(name):
     if not value: raise Problem('Studio setup is incomplete. Contact the studio owner.', 503)
     return value
 
+def readiness():
+    auth_keys = ['SUPABASE_URL', 'SUPABASE_ANON_KEY', 'SUPABASE_SERVICE_ROLE_KEY', 'ALLOWED_EMAILS']
+    auth_ready = all(os.getenv(name) for name in auth_keys)
+    hf_key = os.getenv('HF_KEY', '')
+    provider_configured = ':' in hf_key and all(hf_key.split(':', 1))
+    return auth_ready, provider_configured, auth_ready and provider_configured
+
 def sb(method, path, *, admin=True, token=None, **kwargs):
     key = env('SUPABASE_SERVICE_ROLE_KEY' if admin else 'SUPABASE_ANON_KEY')
     headers = {'apikey': key, 'Authorization': 'Bearer ' + (token or key)}
     headers.update(kwargs.pop('headers', {}))
-    r = httpx.request(method, env('SUPABASE_URL').rstrip('/') + path, headers=headers, timeout=20, **kwargs)
+    try:
+        r = httpx.request(method, env('SUPABASE_URL').rstrip('/') + path, headers=headers, timeout=20, **kwargs)
+    except httpx.RequestError:
+        raise Problem('The data service could not complete this request.', 502)
     if r.is_error:
         if r.status_code == 401: raise Problem('Please sign in again.', 401)
         raise Problem('The data service could not complete this request.', 502)
@@ -79,9 +89,39 @@ def index(): return send_from_directory(ROOT / 'public', 'index.html')
 
 @app.get('/api/config')
 def config():
-    auth_ready = all(os.getenv(x) for x in ['SUPABASE_URL', 'SUPABASE_ANON_KEY', 'SUPABASE_SERVICE_ROLE_KEY', 'ALLOWED_EMAILS'])
-    return jsonify(auth_ready=auth_ready, generation_ready=auth_ready and bool(os.getenv('HF_KEY')),
+    auth_ready, provider_configured, generation_ready = readiness()
+    return jsonify(auth_ready=auth_ready, generation_ready=generation_ready,
+                   provider_configured=provider_configured,
                    model='Kling 3.0 Standard', payments=False)
+
+@app.get('/api/health')
+def health():
+    auth_ready, provider_configured, generation_ready = readiness()
+    supabase_reachable = None
+    if auth_ready:
+        try:
+            sb('GET', '/rest/v1/generations', params={'select':'id', 'limit':'1'})
+            supabase_reachable = True
+        except Problem:
+            supabase_reachable = False
+
+    if auth_ready and provider_configured and supabase_reachable:
+        status, code = 'ready', 200
+    elif auth_ready and supabase_reachable is False:
+        status, code = 'degraded', 503
+    else:
+        status, code = 'setup_required', 200
+
+    return jsonify(
+        ok=status == 'ready',
+        status=status,
+        service='novaframe-video-studio',
+        auth_ready=auth_ready,
+        generation_ready=generation_ready,
+        provider_configured=provider_configured,
+        supabase_reachable=supabase_reachable,
+        payments=False,
+    ), code
 
 def cookies(response, data):
     for name, value, age in [('nf_access', data['access_token'], data.get('expires_in', 3600)), ('nf_refresh', data['refresh_token'], 604800)]:

@@ -54,6 +54,16 @@ Create a dedicated private repository (do not use the unrelated Toji-cooks repos
 
 Set all six values in `.env.example` on Vercel, replacing `APP_ORIGIN` with the exact deployed HTTPS origin and setting `COOKIE_SECURE=1`. `VERCEL` also enables secure cookies automatically. Keep the app invitation-only until a real user isolation test and real generation succeed.
 
+## Health check
+
+Use `GET /api/health` to verify a deployment without creating a billable generation.
+
+- `ready`: Supabase is reachable and the Higgsfield credential is configured.
+- `setup_required`: one or more required environment values are missing or malformed.
+- `degraded`: Supabase was configured but could not be reached.
+
+The health check never submits a Higgsfield generation and never returns secret values.
+
 ## Tests
 
 ```sh
@@ -61,6 +71,8 @@ pip install pytest
 python -m pytest -q
 node --check public/app.js
 ```
+
+GitHub Actions also runs these checks automatically from `.github/workflows/verify.yml`; continuation changes should pass this workflow before merging.
 
 ## Operational limitations
 
