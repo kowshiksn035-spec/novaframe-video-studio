@@ -236,10 +236,30 @@ def status(job_id):
         url = video.get('url') if isinstance(video, dict) else video
         if not isinstance(url, str) or urlparse(url).scheme != 'https': raise Problem('Provider returned an invalid video result.', 502)
         row = update_job(row['id'], status='completed', video_url=url)
-    elif isinstance(state, (hf.Failed, hf.NSFW, hf.Cancelled)):
+    elif isinstance(state, hf.Cancelled):
+        row = update_job(row['id'], status='cancelled', error=None)
+    elif isinstance(state, (hf.Failed, hf.NSFW)):
         row = update_job(row['id'], status='failed', error='The provider could not generate this video. Try a different prompt.')
     else:
         row = update_job(row['id'], status='processing' if isinstance(state, hf.InProgress) else 'queued')
+    return jsonify(row)
+
+@app.post('/api/generations/<job_id>/cancel')
+@signed_in
+def cancel_generation(job_id):
+    row = get_job(job_id)
+    if row['status'] in TERMINAL:
+        return jsonify(row)
+    if row['status'] != 'queued' or not row.get('provider_id'):
+        raise Problem('This generation can no longer be cancelled.', 409)
+
+    try:
+        hf.SyncClient(api_key=env('HF_KEY'), timeout=20).cancel(row['provider_id'])
+    except Exception:
+        # Do not mark a job cancelled unless the provider confirms the cancel request.
+        raise Problem('The provider could not cancel this generation. Check its status instead.', 409)
+
+    row = update_job(row['id'], status='cancelled', error=None)
     return jsonify(row)
 
 @app.post('/api/uploads')

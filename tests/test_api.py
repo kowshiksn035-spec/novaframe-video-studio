@@ -83,6 +83,25 @@ def test_completed(client,monkeypatch):
  def handler(method,path,**kw):return [{'id':job,'status':'queued','provider_id':'p1'}] if method=='GET' else [{'id':job,**kw['json']}]
  auth(monkeypatch,handler);monkeypatch.setattr(m.hf,'SyncClient',lambda **k:SimpleNamespace(status=lambda _:m.hf.Completed(),result=lambda _:{'video':{'url':'https://cdn.example/video.mp4'}}));r=client.get('/api/generations/'+job);assert r.json['status']=='completed';assert r.json['video_url'].endswith('.mp4')
 
+def test_provider_cancelled_status(client,monkeypatch):
+ job=str(uuid.uuid4())
+ def handler(method,path,**kw):return [{'id':job,'status':'queued','provider_id':'p1'}] if method=='GET' else [{'id':job,**kw['json']}]
+ auth(monkeypatch,handler);monkeypatch.setattr(m.hf,'SyncClient',lambda **k:SimpleNamespace(status=lambda _:m.hf.Cancelled()));r=client.get('/api/generations/'+job);assert r.json['status']=='cancelled'
+
+def test_cancel_queued_generation(client,monkeypatch):
+ job=str(uuid.uuid4());cancelled=[]
+ def handler(method,path,**kw):
+  if method=='GET':return [{'id':job,'status':'queued','provider_id':'p1'}]
+  assert kw['json']=={'status':'cancelled','error':None};return [{'id':job,'status':'cancelled','provider_id':'p1','error':None}]
+ auth(monkeypatch,handler);monkeypatch.setattr(m.hf,'SyncClient',lambda **k:SimpleNamespace(cancel=lambda provider_id:cancelled.append(provider_id)))
+ r=client.post('/api/generations/'+job+'/cancel',headers={'Origin':'http://localhost'});assert r.status_code==200;assert r.json['status']=='cancelled';assert cancelled==['p1']
+
+def test_cancel_processing_generation_is_rejected(client,monkeypatch):
+ job=str(uuid.uuid4())
+ auth(monkeypatch,lambda method,path,**kw:[{'id':job,'status':'processing','provider_id':'p1'}])
+ monkeypatch.setattr(m.hf,'SyncClient',lambda **k:pytest.fail('Provider cancel should not be called'))
+ r=client.post('/api/generations/'+job+'/cancel',headers={'Origin':'http://localhost'});assert r.status_code==409
+
 def test_provider_wire_contract(monkeypatch):
  monkeypatch.setenv('HF_KEY','test:secret')
  calls=[]
