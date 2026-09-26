@@ -32,11 +32,31 @@ def env(name):
     if not value: raise Problem('Studio setup is incomplete. Contact the studio owner.', 503)
     return value
 
+def selfhost():
+    return os.getenv('VIDEO_BACKEND', 'selfhost') == 'selfhost'
+
+def models():
+    if not selfhost(): return SUPPORTED_MODELS
+    return {'cogvideox-local': {'label': 'CogVideoX · Your GPU'}}
+
+def default_model():
+    return 'cogvideox-local' if selfhost() else DEFAULT_MODEL
+
+def public_job(row):
+    row = dict(row)
+    if str(row.get('video_url', '')).startswith('storage://'):
+        path = row['video_url'][len('storage://'):]
+        expected = f"generated-videos/{row['user_id']}/{row['id']}.mp4"
+        if path != expected: raise Problem('Invalid video location.', 502)
+        signed = sb('POST', '/storage/v1/object/sign/' + path, json={'expiresIn':3600})
+        row['video_url'] = env('SUPABASE_URL').rstrip('/') + '/storage/v1' + signed['signedURL']
+    return row
+
 def readiness():
     auth_keys = ['SUPABASE_URL', 'SUPABASE_ANON_KEY', 'SUPABASE_SERVICE_ROLE_KEY', 'ALLOWED_EMAILS']
     auth_ready = all(os.getenv(name) for name in auth_keys)
     hf_key = os.getenv('HF_KEY', '')
-    provider_configured = ':' in hf_key and all(hf_key.split(':', 1))
+    provider_configured = os.getenv('SELFHOST_ENABLED') == '1' if selfhost() else ':' in hf_key and all(hf_key.split(':', 1))
     return auth_ready, provider_configured, auth_ready and provider_configured
 
 def sb(method, path, *, admin=True, token=None, **kwargs):
@@ -102,9 +122,10 @@ def config():
     auth_ready, provider_configured, generation_ready = readiness()
     return jsonify(auth_ready=auth_ready, generation_ready=generation_ready,
                    provider_configured=provider_configured,
-                   model=SUPPORTED_MODELS[DEFAULT_MODEL]['label'],
-                   default_model=DEFAULT_MODEL,
-                   models=[{'id': model_id, 'label': item['label']} for model_id, item in SUPPORTED_MODELS.items()],
+                   backend='selfhost' if selfhost() else 'higgsfield',
+                   model=models()[default_model()]['label'],
+                   default_model=default_model(),
+                   models=[{'id': model_id, 'label': item['label']} for model_id, item in models().items()],
                    payments=False)
 
 @app.get('/api/health')
@@ -191,7 +212,7 @@ def update_job(job_id, **values):
 @app.get('/api/generations')
 @signed_in
 def history():
-    return jsonify(sb('GET', '/rest/v1/generations', params={'user_id':'eq.' + g.user, 'select':'*', 'order':'created_at.desc', 'limit':'100'}))
+    return jsonify([public_job(row) for row in sb('GET', '/rest/v1/generations', params={'user_id':'eq.' + g.user, 'select':'*', 'order':'created_at.desc', 'limit':'100'})])
 
 @app.get('/api/generations/active')
 @signed_in
@@ -217,14 +238,16 @@ def submit_provider(model_id, mode, arguments):
 @app.post('/api/generations')
 @signed_in
 def generate():
-    env('HF_KEY')
+    if selfhost():
+        if os.getenv('SELFHOST_ENABLED') != '1': raise Problem('Your GPU worker needs setup before generation.', 503)
+    else: env('HF_KEY')
     data = request.get_json(silent=True) or {}
     prompt = data.get('prompt', '')
     if not isinstance(prompt, str) or not 10 <= len(prompt.strip()) <= 1200: raise Problem('Write a prompt between 10 and 1,200 characters.')
     mode = data.get('mode', 'text')
-    model_id = data.get('model', DEFAULT_MODEL)
-    duration, ratio, motion = data.get('duration', 5), data.get('ratio', '16:9'), data.get('motion', '')
-    if model_id not in SUPPORTED_MODELS or mode not in ['text', 'image'] or type(duration) is not int or duration not in [5,10] or ratio not in ['16:9','9:16','1:1'] or motion not in ['', 'Dolly In', 'Orbit', 'FPV', 'Pan Left', 'Zoom Out', 'Static']:
+    model_id = data.get('model', default_model())
+    duration, ratio, motion = data.get('duration', 6 if selfhost() else 5), data.get('ratio', '3:2' if selfhost() else '16:9'), data.get('motion', '')
+    if model_id not in models() or mode not in ['text', 'image'] or type(duration) is not int or duration not in ([6] if selfhost() else [5,10]) or ratio not in (['3:2'] if selfhost() else ['16:9','9:16','1:1']) or motion not in ['', 'Dolly In', 'Orbit', 'FPV', 'Pan Left', 'Zoom Out', 'Static']:
         raise Problem('Unsupported generation settings.')
     image_path = data.get('image_path')
     if mode == 'image':
@@ -237,6 +260,8 @@ def generate():
     if not reserved['created']:
         if reserved['job']['settings'] != settings: raise Problem('Request identifier already used for different settings.', 409)
         return jsonify(reserved['job']), 200
+    if selfhost():
+        return jsonify(update_job(job_id, provider_id='selfhost:' + job_id, status='queued')), 202
     args = {'prompt': prompt.strip() + ('. Camera: ' + motion if motion else ''), 'duration': duration, 'sound':'off', 'multi_shots':False, 'cfg_scale':0.5}
     try:
         if mode == 'image':
@@ -255,7 +280,7 @@ def generate():
 @signed_in
 def status(job_id):
     row = get_job(job_id)
-    if row['status'] in TERMINAL or not row.get('provider_id'): return jsonify(row)
+    if row['status'] in TERMINAL or not row.get('provider_id') or row['provider_id'].startswith('selfhost:'): return jsonify(public_job(row))
     client = hf.SyncClient(api_key=env('HF_KEY'), timeout=20)
     state = client.status(row['provider_id'])
     if isinstance(state, hf.Completed):
@@ -280,6 +305,11 @@ def cancel_generation(job_id):
         return jsonify(row)
     if row['status'] != 'queued' or not row.get('provider_id'):
         raise Problem('This generation can no longer be cancelled.', 409)
+
+    if row['provider_id'].startswith('selfhost:'):
+        rows = sb('PATCH', '/rest/v1/generations', params={'id':'eq.' + row['id'], 'user_id':'eq.' + g.user, 'status':'eq.queued'}, json={'status':'cancelled', 'error':None}, headers={'Prefer':'return=representation'})
+        if not rows: raise Problem('The worker has already started this generation.', 409)
+        return jsonify(rows[0])
 
     try:
         hf.SyncClient(api_key=env('HF_KEY'), timeout=20).cancel(row['provider_id'])

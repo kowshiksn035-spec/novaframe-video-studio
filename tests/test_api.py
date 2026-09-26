@@ -5,6 +5,7 @@ from api import index as m
 UID='11111111-1111-1111-1111-111111111111'
 @pytest.fixture
 def client(monkeypatch):
+ monkeypatch.setenv('VIDEO_BACKEND','higgsfield')
  monkeypatch.setenv('ALLOWED_EMAILS','creator@example.com');monkeypatch.setenv('HF_KEY','test:secret');monkeypatch.setenv('APP_ORIGIN','http://localhost')
  m.app.config['TESTING']=True;c=m.app.test_client();c.set_cookie('nf_access','test',path='/api');return c
 
@@ -126,3 +127,45 @@ def test_provider_wire_contract(monkeypatch):
  assert calls[0][0]=='https://api.higgsfield.ai/kling-video/v3.0/std/image-to-video'
  assert calls[0][1]['headers']['Authorization']=='Key test:secret'
  assert len(calls)==1
+
+def test_local_submission_never_calls_provider(client,monkeypatch):
+ monkeypatch.setenv('VIDEO_BACKEND','selfhost');monkeypatch.setenv('SELFHOST_ENABLED','1');monkeypatch.delenv('HF_KEY',raising=False)
+ monkeypatch.setattr(m,'submit_provider',lambda *a:pytest.fail('Paid provider called'))
+ def handler(method,path,**kw):
+  if path.endswith('reserve_generation'):return {'created':True}
+  assert method=='PATCH';assert kw['json']['provider_id'].startswith('selfhost:');return [kw['json']]
+ auth(monkeypatch,handler)
+ assert post(client,payload(duration=6,ratio='3:2')).json['status']=='queued'
+
+def test_local_requires_explicit_enable(client,monkeypatch):
+ monkeypatch.setenv('VIDEO_BACKEND','selfhost');monkeypatch.delenv('SELFHOST_ENABLED',raising=False)
+ auth(monkeypatch,lambda *a,**k:pytest.fail('Disabled queue touched'))
+ assert post(client,payload(duration=6,ratio='3:2')).status_code==503
+
+def test_local_poll_does_not_contact_higgsfield(client,monkeypatch):
+ job={'id':str(uuid.uuid4()),'status':'processing','provider_id':'selfhost:abc'}
+ auth(monkeypatch,lambda *a,**k:[job]);monkeypatch.delenv('HF_KEY',raising=False)
+ assert client.get('/api/generations/'+job['id']).json==job
+
+def test_local_cancel_race(client,monkeypatch):
+ job={'id':str(uuid.uuid4()),'status':'queued','provider_id':'selfhost:abc'}
+ def handler(method,path,**kw):
+  if method=='GET':return [job]
+  assert kw['params']['status']=='eq.queued';return []
+ auth(monkeypatch,handler)
+ assert client.post('/api/generations/'+job['id']+'/cancel',headers={'Origin':'http://localhost'}).status_code==409
+
+def test_output_signed_only_for_owner_path(client,monkeypatch):
+ job={'id':str(uuid.uuid4()),'user_id':UID,'status':'completed','video_url':'storage://generated-videos/another-user/file.mp4'}
+ auth(monkeypatch,lambda *a,**k:[job])
+ assert client.get('/api/generations/'+job['id']).status_code==502
+
+def test_local_output_signed(client,monkeypatch):
+ job={'id':str(uuid.uuid4()),'user_id':UID,'status':'completed'}
+ job['video_url']=f"storage://generated-videos/{UID}/{job['id']}.mp4"
+ monkeypatch.setenv('SUPABASE_URL','https://test.supabase.co')
+ def handler(method,path,**kw):
+  if method=='GET':return [job]
+  assert path=='/storage/v1/object/sign/'+job['video_url'][10:];return {'signedURL':'/object/sign/private?token=test'}
+ auth(monkeypatch,handler)
+ assert client.get('/api/generations/'+job['id']).json['video_url'].startswith('https://test.supabase.co/storage/v1/')

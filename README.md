@@ -1,3 +1,9 @@
+# Self-hosted video generation
+
+NovaFrame now defaults to a local CogVideoX GPU worker. No Higgsfield API key or payments are required for this backend. See [worker setup and real-video test checklist](worker/README.md). Generation stays disabled until `SELFHOST_ENABLED=1`; this switch does not verify worker availability. Real GPU rendering has not yet been validated.
+
+The instructions below describe the original optional Higgsfield backend. To use it explicitly, set `VIDEO_BACKEND=higgsfield`. Existing Flask/Supabase architecture and historical jobs are preserved.
+
 # NovaFrame AI Video Studio MVP
 
 A Vercel-compatible Flask app with a responsive studio, Supabase authentication and persistence, private reference-image storage, and Higgsfield Kling 3.0 submission/status integration. No payments, fake credits, simulated videos, or fake progress.
