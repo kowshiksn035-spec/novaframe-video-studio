@@ -1,93 +1,104 @@
-# Self-hosted video generation
+# NovaFrame AI Video Studio
 
-NovaFrame now defaults to a local CogVideoX GPU worker. No Higgsfield API key or payments are required for this backend. See [worker setup and real-video test checklist](worker/README.md). Generation stays disabled until `SELFHOST_ENABLED=1`; this switch does not verify worker availability. Real GPU rendering has not yet been validated.
+NovaFrame is a private-beta AI video creator inspired by modern video-generation studios. The product UI is its own app; **Higgsfield is only a product reference and is not an active generation provider.**
 
-The instructions below describe the original optional Higgsfield backend. To use it explicitly, set `VIDEO_BACKEND=higgsfield`. Existing Flask/Supabase architecture and historical jobs are preserved.
+## Current architecture
 
-# NovaFrame AI Video Studio MVP
+- Flask/Python web API
+- Static responsive frontend in `public/`
+- Supabase Auth, Postgres and private Storage
+- Local outbound-only GPU worker in `worker/`
+- LTX-Video 2B distilled 0.9.8 for real text-to-video and image-to-video
+- Vercel-compatible web hosting
+- No payments, subscriptions or purchased generation credits
 
-A Vercel-compatible Flask app with a responsive studio, Supabase authentication and persistence, private reference-image storage, and Higgsfield Kling 3.0 submission/status integration. No payments, fake credits, simulated videos, or fake progress.
+The web app never runs GPU inference. It creates a queued Supabase job. The trusted local worker claims the job, runs LTX diffusion, uploads the generated MP4 into the private `generated-videos` bucket, and marks the job completed. The browser receives only a short-lived signed playback URL.
 
-## Current delivery status
+There is intentionally **no static-photo zoom fallback**. If the GPU/model cannot produce a real video, the job fails.
 
-- Implemented: invitation-only password sign-in with HttpOnly cookies and refresh, text/image generation forms, reference upload and image re-encoding, camera prompt guidance, generation history, status polling, video playback and open/save link.
-- Implemented: owner checks, RLS migration, atomic reservation and per-user rolling 24-hour limit (10), one active job per user, request deduplication, no retries of billable submissions.
-- Automated verification: 17 mocked backend tests pass. They do not establish live provider or database integration.
-- Figma design: https://www.figma.com/design/XW8kKwAVNyF5A7BdGhME0K
-- A Vercel preview was submitted, but inspection is blocked by account scope permissions and browser preview requires Vercel sign-in. Do not treat it as a verified working deployment.
-- Supabase project created: `novaframe-video-studio`, ref `rlkhcenojjsqrfqglvsu`, region `ap-south-1`, quoted cost $0/month. Migration `create_video_studio` applied successfully.
-- Still needed: server environment credentials, Higgsfield Cloud API key, Vercel environment configuration. No real generation has run.
-- Source repository: https://github.com/kowshiksn035-spec/novaframe-video-studio (private).
+## Local generation profile
 
-## Run locally
+- model ID: `ltx-video-local`
+- 672 × 448, 3:2
+- 121 generated frames
+- 24 fps
+- roughly 5 seconds
+- text-to-video and image-to-video
+- camera buttons become prompt guidance, not post-processing transforms
 
-Python 3.12 recommended. From this folder:
+See `worker/README.md` for GPU requirements and setup.
+
+## Web app setup
+
+Python 3.12 is recommended for the Flask app:
 
 ```sh
 python -m venv .venv
-# Windows: .venv\Scripts\activate
-# macOS/Linux: source .venv/bin/activate
+# activate the environment
 pip install -r requirements.txt
 pip install python-dotenv
 cp .env.example .env
 python -m flask --app api.index run --port 5000
 ```
 
-On Windows use `Copy-Item .env.example .env` instead of `cp` if needed. Flask loads `.env` when python-dotenv is installed. Open http://localhost:5000. Without credentials the studio shows a setup notice and disables generation.
+Web environment:
 
-## Supabase setup
+```text
+SUPABASE_URL=...
+SUPABASE_ANON_KEY=...
+SUPABASE_SERVICE_ROLE_KEY=...
+SELFHOST_ENABLED=0
+ALLOWED_EMAILS=...
+APP_ORIGIN=http://localhost:5000
+COOKIE_SECURE=0
+```
 
-1. Existing project: `rlkhcenojjsqrfqglvsu` in the owner's selected organization.
-2. The migration is already applied to that project. Apply `supabase/migrations/202609180001_studio.sql` only when provisioning another fresh project.
-3. Create the invited beta user through Supabase Auth, with an email/password. User invitation email/password flows are managed in Supabase, not implemented as public signup in this app.
-4. Set `SUPABASE_URL`, `SUPABASE_ANON_KEY`, and `SUPABASE_SERVICE_ROLE_KEY` on the server. Never put the service-role key in browser code.
-5. Set `ALLOWED_EMAILS` to a comma-separated list of invited users. An empty list denies access.
+Set `SELFHOST_ENABLED=1` only after `python worker/run.py --check` succeeds and the worker is ready.
 
-## Higgsfield setup
+## Supabase
 
-Set `HF_KEY` to the Higgsfield Cloud API `key-id:key-secret`, using Vercel's encrypted environment settings. A ChatGPT Higgsfield connector does not provide this app with a reusable secret. Provider generations can incur provider charges even though this MVP has no payments.
+Existing project: `novaframe-video-studio` (`rlkhcenojjsqrfqglvsu`, `ap-south-1`).
 
-Verified model references:
-- https://console.higgsfield.ai/models/kling-video/v3.0/std/text-to-video/api-reference
-- https://console.higgsfield.ai/models/kling-video/v3.0/std/image-to-video/playground
-- https://github.com/higgsfield-ai/higgsfield-client
+The existing migration provides:
+- owner-scoped generations
+- RLS
+- atomic reservation/deduplication
+- rolling beta limit
+- one active job per user
+- private reference-image storage
 
-The MVP uses 5/10 seconds, silent output, text ratios 16:9/9:16/1:1. Image-to-video follows image proportions. Camera direction is included in the prompt, not a guaranteed camera-control parameter.
+The worker creates `generated-videos` as a private MP4 bucket if it does not exist.
 
-## GitHub / Vercel
+Historical failed generations from earlier provider experiments are retained as history. Nonterminal legacy provider jobs are never contacted by the current app.
 
-Create a dedicated private repository (do not use the unrelated Toji-cooks repository). Commit this folder, excluding `.env` and caches. Import it into Vercel with the root directory set to this folder. `vercel.json` routes requests to the Python API, which also serves `public/` assets.
+## Safety
 
-Set all six values in `.env.example` on Vercel, replacing `APP_ORIGIN` with the exact deployed HTTPS origin and setting `COOKIE_SECURE=1`. `VERCEL` also enables secure cookies automatically. Keep the app invitation-only until a real user isolation test and real generation succeed.
+- service-role key stays server/worker-side
+- reference images and output videos remain private
+- generated videos are returned through signed URLs
+- generation IDs are deduplicated
+- queue claims use compare-and-set
+- queued jobs can be cancelled safely
+- processing jobs are not blindly retried
+- no active paid AI provider integration exists
 
-## Health check
+## Health
 
-Use `GET /api/health` to verify a deployment without creating a billable generation.
-
-- `ready`: Supabase is reachable and the Higgsfield credential is configured.
-- `setup_required`: one or more required environment values are missing or malformed.
-- `degraded`: Supabase was configured but could not be reached.
-
-The health check never submits a Higgsfield generation and never returns secret values.
+`GET /api/health` is non-billable. It reports `ready` when Supabase is reachable and `SELFHOST_ENABLED=1`. The flag confirms queuing is enabled; it is not a live heartbeat from the GPU worker.
 
 ## Tests
 
 ```sh
 pip install pytest
 python -m pytest -q
+python -m compileall -q api app.py tests worker
 node --check public/app.js
 ```
 
-GitHub Actions also runs these checks automatically from `.github/workflows/verify.yml`; continuation changes should pass this workflow before merging.
+GitHub Actions runs these checks on pull requests.
 
-## Operational limitations
+## Remaining live milestone
 
-- Results are provider-hosted URLs, not copied into permanent video storage. Save videos before provider URLs expire.
-- Status refresh is on demand. Closing the browser does not cancel the provider job; reopen it from Generations to refresh.
-- A submission timeout or crash can leave `needs_review` or `submitting`. Check the provider dashboard before changing that record; never blindly resubmit. After confirming the provider request ID, set `provider_id` and status `queued` in the admin database. If no request was accepted, mark `failed`.
-- Uploaded reference images remain in the private bucket. Storage cleanup and account deletion UX are not part of this MVP.
-- Provider errors are deliberately generic; no secrets are returned or printed.
-- Public registration, payments, social sharing, audio editing, and multi-scene timeline editing are out of scope.
+Repository tests can verify the queue, security and worker code, but a **real LTX render must run on the user's GPU machine** because model weights and CUDA inference are intentionally not executed in GitHub CI. A successful live proof is:
 
-Latest submitted preview (requires Vercel access; build unverified):
-https://novaframe-video-studio-9suay8r96-kowshiksn035-5936.vercel.app
+prompt → queued → processing → real multi-frame LTX MP4 → private Supabase upload → completed → browser playback/history.
