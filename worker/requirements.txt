@@ -1,10 +1,6 @@
-torch==2.8.0
-diffusers==0.35.1
-transformers==4.55.4
-accelerate==1.10.1
-sentencepiece==0.2.1
-imageio-ffmpeg==0.6.0
-imageio==2.37.0
+# Install a CUDA-enabled PyTorch build for your GPU first.
+# LTX-Video is pinned to the exact upstream revision validated for this worker.
+ltx-video[inference] @ git+https://github.com/Lightricks/LTX-Video.git@4b2d053057623ddd4d0a1d3e9cd28890e9ef487f
 httpx==0.28.1
-Pillow==11.3.0
 python-dotenv==1.1.1
+PyYAML==6.0.2

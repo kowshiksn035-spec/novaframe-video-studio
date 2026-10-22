@@ -4,7 +4,7 @@ on:
   push:
     branches:
       - main
-      - continue-mvp-healthcheck
+      - real-ltx-video-worker
   pull_request:
 
 jobs:
@@ -20,17 +20,24 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Install backend dependencies
+      - name: Install web/test dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pytest
 
-      - name: Run backend tests
+      - name: Run backend and worker unit tests
         run: python -m pytest -q
 
       - name: Validate Python syntax
-        run: python -m compileall -q api app.py tests
+        run: python -m compileall -q api app.py tests worker
+
+      - name: Ensure paid Higgsfield runtime is gone
+        run: |
+          if grep -R "api.higgsfield.ai" api worker requirements.txt; then
+            echo "Paid Higgsfield runtime reference found"
+            exit 1
+          fi
 
       - name: Set up Node
         uses: actions/setup-node@v4
