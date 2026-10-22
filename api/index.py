@@ -2,27 +2,21 @@
 import io, os, uuid
 from pathlib import Path
 from functools import wraps
-from urllib.parse import urlparse
 import httpx
 from flask import Flask, request, jsonify, send_from_directory, g
 from werkzeug.exceptions import HTTPException
 from PIL import Image, UnidentifiedImageError
-import higgsfield_client as hf
 
 ROOT = Path(__file__).resolve().parents[1]
 app = Flask(__name__, static_folder=str(ROOT / 'public'), static_url_path='')
 app.config['MAX_CONTENT_LENGTH'] = 4 * 1024 * 1024
 TERMINAL = {'completed', 'failed', 'cancelled', 'needs_review'}
-DEFAULT_MODEL = 'kling-3-standard'
-SUPPORTED_MODELS = {
-    DEFAULT_MODEL: {
-        'label': 'Kling 3.0 Standard',
-        'applications': {
-            'text': 'kling-video/v3.0/std/text-to-video',
-            'image': 'kling-video/v3.0/std/image-to-video',
-        },
-    },
+LOCAL_MODEL = 'ltx-video-local'
+LOCAL_MODELS = {
+    LOCAL_MODEL: {'label': 'LTX-Video 2B Distilled · Local GPU'},
 }
+LOCAL_DURATION = 5
+LOCAL_RATIO = '3:2'
 
 class Problem(Exception):
     def __init__(self, message, status=400): self.message, self.status = message, status
@@ -32,15 +26,11 @@ def env(name):
     if not value: raise Problem('Studio setup is incomplete. Contact the studio owner.', 503)
     return value
 
-def selfhost():
-    return os.getenv('VIDEO_BACKEND', 'selfhost') == 'selfhost'
-
 def models():
-    if not selfhost(): return SUPPORTED_MODELS
-    return {'cogvideox-local': {'label': 'CogVideoX · Your GPU'}}
+    return LOCAL_MODELS
 
 def default_model():
-    return 'cogvideox-local' if selfhost() else DEFAULT_MODEL
+    return LOCAL_MODEL
 
 def public_job(row):
     row = dict(row)
@@ -55,9 +45,8 @@ def public_job(row):
 def readiness():
     auth_keys = ['SUPABASE_URL', 'SUPABASE_ANON_KEY', 'SUPABASE_SERVICE_ROLE_KEY', 'ALLOWED_EMAILS']
     auth_ready = all(os.getenv(name) for name in auth_keys)
-    hf_key = os.getenv('HF_KEY', '')
-    provider_configured = os.getenv('SELFHOST_ENABLED') == '1' if selfhost() else ':' in hf_key and all(hf_key.split(':', 1))
-    return auth_ready, provider_configured, auth_ready and provider_configured
+    worker_enabled = os.getenv('SELFHOST_ENABLED') == '1'
+    return auth_ready, worker_enabled, auth_ready and worker_enabled
 
 def sb(method, path, *, admin=True, token=None, **kwargs):
     key = env('SUPABASE_SERVICE_ROLE_KEY' if admin else 'SUPABASE_ANON_KEY')
@@ -119,10 +108,10 @@ def index(): return send_from_directory(ROOT / 'public', 'index.html')
 
 @app.get('/api/config')
 def config():
-    auth_ready, provider_configured, generation_ready = readiness()
+    auth_ready, worker_enabled, generation_ready = readiness()
     return jsonify(auth_ready=auth_ready, generation_ready=generation_ready,
-                   provider_configured=provider_configured,
-                   backend='selfhost' if selfhost() else 'higgsfield',
+                   provider_configured=worker_enabled, worker_enabled=worker_enabled,
+                   backend='selfhost',
                    model=models()[default_model()]['label'],
                    default_model=default_model(),
                    models=[{'id': model_id, 'label': item['label']} for model_id, item in models().items()],
@@ -226,99 +215,73 @@ def active_generation():
     })
     return jsonify(rows[0] if rows else None)
 
-def submit_provider(model_id, mode, arguments):
-    model = SUPPORTED_MODELS[model_id]
-    application = model['applications'][mode]
-    endpoint = 'https://api.higgsfield.ai/' + application
-    # httpx does not retry requests by default. No SDK retry wrapper for POST.
-    response = httpx.post(endpoint, headers={'Authorization':'Key ' + env('HF_KEY')}, json=arguments, timeout=20)
-    response.raise_for_status()
-    return response.json()['request_id']
-
 @app.post('/api/generations')
 @signed_in
 def generate():
-    if selfhost():
-        if os.getenv('SELFHOST_ENABLED') != '1': raise Problem('Your GPU worker needs setup before generation.', 503)
-    else: env('HF_KEY')
+    if os.getenv('SELFHOST_ENABLED') != '1':
+        raise Problem('Your real local GPU worker needs setup before generation.', 503)
     data = request.get_json(silent=True) or {}
     prompt = data.get('prompt', '')
-    if not isinstance(prompt, str) or not 10 <= len(prompt.strip()) <= 1200: raise Problem('Write a prompt between 10 and 1,200 characters.')
+    if not isinstance(prompt, str) or not 10 <= len(prompt.strip()) <= 1200:
+        raise Problem('Write a prompt between 10 and 1,200 characters.')
     mode = data.get('mode', 'text')
     model_id = data.get('model', default_model())
-    duration, ratio, motion = data.get('duration', 6 if selfhost() else 5), data.get('ratio', '3:2' if selfhost() else '16:9'), data.get('motion', '')
-    if model_id not in models() or mode not in ['text', 'image'] or type(duration) is not int or duration not in ([6] if selfhost() else [5,10]) or ratio not in (['3:2'] if selfhost() else ['16:9','9:16','1:1']) or motion not in ['', 'Dolly In', 'Orbit', 'FPV', 'Pan Left', 'Zoom Out', 'Static']:
+    duration = data.get('duration', LOCAL_DURATION)
+    ratio = data.get('ratio', LOCAL_RATIO)
+    motion = data.get('motion', '')
+    if (model_id not in models() or mode not in ['text', 'image']
+            or type(duration) is not int or duration != LOCAL_DURATION
+            or ratio != LOCAL_RATIO
+            or motion not in ['', 'Dolly In', 'Orbit', 'FPV', 'Pan Left', 'Zoom Out', 'Static']):
         raise Problem('Unsupported generation settings.')
     image_path = data.get('image_path')
     if mode == 'image':
-        if not isinstance(image_path, str) or not image_path.startswith(g.user + '/') or '..' in image_path or len(image_path.split('/')) != 2:
+        if (not isinstance(image_path, str) or not image_path.startswith(g.user + '/')
+                or '..' in image_path or len(image_path.split('/')) != 2):
             raise Problem('Upload a reference image first.')
     job_id = uuid_string(data.get('id'))
-    settings = dict(prompt=prompt.strip(), model=model_id, mode=mode, duration=duration, ratio=ratio, motion=motion, image_path=image_path if mode == 'image' else None)
-    reserved = sb('POST', '/rest/v1/rpc/reserve_generation', json={'p_id':job_id, 'p_user':g.user, 'p_settings':settings})
-    if reserved.get('error'): raise Problem(reserved['error'], 429)
+    settings = dict(
+        prompt=prompt.strip(), model=model_id, mode=mode, duration=duration,
+        ratio=ratio, motion=motion, image_path=image_path if mode == 'image' else None
+    )
+    reserved = sb('POST', '/rest/v1/rpc/reserve_generation',
+                  json={'p_id':job_id, 'p_user':g.user, 'p_settings':settings})
+    if reserved.get('error'):
+        raise Problem(reserved['error'], 429)
     if not reserved['created']:
-        if reserved['job']['settings'] != settings: raise Problem('Request identifier already used for different settings.', 409)
-        return jsonify(reserved['job']), 200
-    if selfhost():
-        return jsonify(update_job(job_id, provider_id='selfhost:' + job_id, status='queued')), 202
-    args = {'prompt': prompt.strip() + ('. Camera: ' + motion if motion else ''), 'duration': duration, 'sound':'off', 'multi_shots':False, 'cfg_scale':0.5}
-    try:
-        if mode == 'image':
-            signed = sb('POST', '/storage/v1/object/sign/references/' + image_path, json={'expiresIn':86400})
-            args['image_url'] = env('SUPABASE_URL') + '/storage/v1' + signed['signedURL']
-        else: args['aspect_ratio'] = ratio
-        # Submit exactly once; never blindly retry a possibly accepted billable request.
-        provider_id = submit_provider(model_id, mode, args)
-        row = update_job(job_id, provider_id=provider_id, status='queued')
-    except Exception:
-        # A timeout can occur after upstream accepted the job. Keep the reservation.
-        row = update_job(job_id, status='needs_review', error='Submission could not be confirmed. Contact the owner before generating again.')
-    return jsonify(row), 202
+        if reserved['job']['settings'] != settings:
+            raise Problem('Request identifier already used for different settings.', 409)
+        return jsonify(public_job(reserved['job'])), 200
+    row = update_job(job_id, provider_id='selfhost:' + job_id, status='queued')
+    return jsonify(public_job(row)), 202
 
 @app.get('/api/generations/<job_id>')
 @signed_in
 def status(job_id):
     row = get_job(job_id)
-    if row['status'] in TERMINAL or not row.get('provider_id') or row['provider_id'].startswith('selfhost:'): return jsonify(public_job(row))
-    client = hf.SyncClient(api_key=env('HF_KEY'), timeout=20)
-    state = client.status(row['provider_id'])
-    if isinstance(state, hf.Completed):
-        result = client.result(row['provider_id'])
-        video = result.get('video', {})
-        url = video.get('url') if isinstance(video, dict) else video
-        if not isinstance(url, str) or urlparse(url).scheme != 'https': raise Problem('Provider returned an invalid video result.', 502)
-        row = update_job(row['id'], status='completed', video_url=url)
-    elif isinstance(state, hf.Cancelled):
-        row = update_job(row['id'], status='cancelled', error=None)
-    elif isinstance(state, (hf.Failed, hf.NSFW)):
-        row = update_job(row['id'], status='failed', error='The provider could not generate this video. Try a different prompt.')
-    else:
-        row = update_job(row['id'], status='processing' if isinstance(state, hf.InProgress) else 'queued')
-    return jsonify(row)
+    if row['status'] in TERMINAL or not row.get('provider_id'):
+        return jsonify(public_job(row))
+    if not row['provider_id'].startswith('selfhost:'):
+        raise Problem('This legacy provider job requires owner review.', 409)
+    return jsonify(public_job(row))
 
 @app.post('/api/generations/<job_id>/cancel')
 @signed_in
 def cancel_generation(job_id):
     row = get_job(job_id)
     if row['status'] in TERMINAL:
-        return jsonify(row)
+        return jsonify(public_job(row))
     if row['status'] != 'queued' or not row.get('provider_id'):
         raise Problem('This generation can no longer be cancelled.', 409)
-
-    if row['provider_id'].startswith('selfhost:'):
-        rows = sb('PATCH', '/rest/v1/generations', params={'id':'eq.' + row['id'], 'user_id':'eq.' + g.user, 'status':'eq.queued'}, json={'status':'cancelled', 'error':None}, headers={'Prefer':'return=representation'})
-        if not rows: raise Problem('The worker has already started this generation.', 409)
-        return jsonify(rows[0])
-
-    try:
-        hf.SyncClient(api_key=env('HF_KEY'), timeout=20).cancel(row['provider_id'])
-    except Exception:
-        # Do not mark a job cancelled unless the provider confirms the cancel request.
-        raise Problem('The provider could not cancel this generation. Check its status instead.', 409)
-
-    row = update_job(row['id'], status='cancelled', error=None)
-    return jsonify(row)
+    if not row['provider_id'].startswith('selfhost:'):
+        raise Problem('Legacy provider cancellation is disabled.', 409)
+    rows = sb('PATCH', '/rest/v1/generations',
+              params={'id':'eq.' + row['id'], 'user_id':'eq.' + g.user, 'status':'eq.queued'},
+              json={'status':'cancelled', 'error':None},
+              headers={'Prefer':'return=representation'})
+    if not rows:
+        raise Problem('The worker has already started this generation.', 409)
+    return jsonify(public_job(rows[0]))
 
 @app.post('/api/uploads')
 @signed_in
