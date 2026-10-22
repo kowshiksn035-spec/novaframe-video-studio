@@ -1,16 +1,43 @@
-# NovaFrame GPU worker
+# NovaFrame real local AI-video worker
 
-This runs open-weight CogVideoX locally. It does not use Higgsfield or paid inference APIs. It generates 49 video frames with diffusion, then encodes an MP4 (about 6 seconds, 720×480, 8 fps). Camera controls are prompt guidance, not guaranteed camera trajectories. Output quality is not guaranteed to match Higgsfield.
+This worker runs **LTX-Video 2B distilled 0.9.8** locally. It performs real multi-frame video diffusion for both text-to-video and image-to-video. It does not call Higgsfield or another paid generation API, and there is deliberately **no still-image zoom / Ken Burns / MoviePy fallback**.
 
-The website remains Flask on Vercel, with authentication, jobs and private output in Supabase. This worker polls the existing queue over HTTPS; it requires no public port. Keep it on a trusted computer: its service-role key has administrative database access. Never share or commit worker/.env.
+The web app stays lightweight on Flask/Vercel. Supabase stores authentication, generation jobs, private reference images and private generated MP4s. The worker polls queued jobs outbound over HTTPS, performs GPU inference, uploads the MP4, then marks the job completed.
 
-## Local setup (Python 3.11, NVIDIA CUDA)
+## Output profile
 
-Run these commands from the repository root in PowerShell or a terminal:
+- Model: LTX-Video 2B distilled 0.9.8
+- Model ID in NovaFrame: `ltx-video-local`
+- Resolution: 672 × 448 (3:2)
+- Frames: 121
+- Frame rate: 24 fps
+- Duration: about 5 seconds
+- Text-to-video: yes
+- Image-to-video: yes
+- Prompt enhancer: disabled to avoid downloading extra LLM/image-caption models
+- CPU offload: enabled to reduce VRAM pressure
+
+121 frames follows LTX-Video's required `8n+1` temporal shape. 672 × 448 is divisible by 32.
+
+## Important hardware rule
+
+This pinned native LTX profile uses bfloat16. Run the hardware check first:
+
+```sh
+python worker/run.py --check
+```
+
+It prints GPU model, VRAM, bfloat16 support and the selected model/profile. If CUDA or bfloat16 is unavailable, NovaFrame stops with a clear error. It does **not** manufacture an animated still image as a substitute.
+
+## Setup
+
+Use Python 3.10 or 3.11 for the worker. Create a separate environment from the Flask app.
 
 ```sh
 python -m venv worker/.venv
 ```
+
+Install a CUDA-enabled PyTorch build appropriate for your GPU using the official PyTorch selector first. Then install the pinned worker requirements:
 
 Windows PowerShell:
 
@@ -28,23 +55,65 @@ worker/.venv/bin/python worker/run.py --check
 cp worker/.env.example worker/.env
 ```
 
-If the check reports no CUDA GPU, install the appropriate CUDA-enabled PyTorch build using the official PyTorch installation selector before continuing. Enter your existing Supabase URL and service-role key in worker/.env on the trusted computer. Start `worker/run.py` using the same virtual-environment Python. Initial generation downloads large model weights from Hugging Face. Review each model's license before use, especially CogVideoX-5b-I2V's model-specific license.
+Put only these values in `worker/.env` on the trusted GPU computer:
 
-The worker creates a private `generated-videos` bucket on startup if absent. In Vercel set `VIDEO_BACKEND=selfhost` and `SELFHOST_ENABLED=1` only after the worker reports ready, then redeploy main. Existing Supabase and authentication environment variables are still needed. HF_KEY is not needed. SELFHOST_ENABLED enables queuing; it is not a live GPU heartbeat. Keep the worker running while testing.
+```text
+SUPABASE_URL=...
+SUPABASE_SERVICE_ROLE_KEY=...
+```
 
-## Hardware and limitations
+Never commit or share that file. The service-role key is administrative.
 
-Text mode uses CogVideoX-2b with FP16 and CPU offload. Image mode uses the larger CogVideoX-5b-I2V model and requires bfloat16 support; the worker rejects unsupported hardware. CPU offload reduces VRAM use but needs substantial system RAM and can be very slow. A GTX 1660 Ti with 16 GB system RAM is not a verified configuration and cannot run this worker's bfloat16 image mode. No claim of successful real rendering is made until tested on the target GPU. No GPU is rented by this setup.
+The worker dependency is pinned to official Lightricks LTX-Video revision:
+`4b2d053057623ddd4d0a1d3e9cd28890e9ef487f`.
 
-## First real tests
+On first real generation, LTX model weights and the spatial upscaler are downloaded from the official `Lightricks/LTX-Video` model repository.
 
-1. Sign into the existing private beta account. Choose Text to video. Prompt: `A red ball rolls across a wooden table, hits a blue block and knocks it over. Static camera, continuous shot, natural physics.`
-2. Generate and watch the worker. Confirm queued → processing → completed. Play the MP4 and check the ball and block actually move. Check history survives reloading.
-3. On a bfloat16-capable GPU, upload a starting image and choose Image to video. Describe clear object movement. Confirm the reference influences the generated clip and there is temporal motion.
-4. Stop the worker, queue another job, cancel it in the app, restart the worker and confirm it does not render the cancelled job.
+## Start
 
-The free beta retains the existing 10 jobs per day and one active job limit to protect local resources. There are no payments or purchased credits. Electricity, hardware, and any hosting beyond free allowances remain real costs.
+After `--check` succeeds, enable queuing in the web app environment:
 
-Jobs interrupted after claiming remain `processing` to prevent duplicate work. The owner must inspect output and mark the job `failed` through Supabase before retrying. Do not automatically requeue interrupted jobs. No resumable render or worker heartbeat is implemented yet.
+```text
+SELFHOST_ENABLED=1
+```
 
-Model documentation: https://huggingface.co/THUDM/CogVideoX-2b and https://huggingface.co/THUDM/CogVideoX-5b-I2V
+Then start the worker:
+
+```sh
+python worker/run.py
+```
+
+For one queued job only:
+
+```sh
+python worker/run.py --once
+```
+
+The worker creates the private `generated-videos` bucket if needed.
+
+## Motion behavior
+
+Camera buttons are converted to literal LTX prompt guidance. They never apply post-generation zoom/crop animation. Even `Static` means a locked camera while the **subject still moves over time**.
+
+NovaFrame also adds explicit temporal language asking for changing subject position, coherent physics, parallax/background movement and changing reflections. The negative prompt rejects frozen subjects, still photographs, slideshows and zoom-only motion.
+
+## First proof test
+
+Use a short, objectively moving scene:
+
+```text
+A red sports car accelerates down a wet neon-lit city street at night. The wheels visibly rotate, the road moves beneath the car, reflections slide across the bodywork, water sprays from the tires, and the background passes continuously. Smooth cinematic side tracking shot with natural motion blur.
+```
+
+The test passes only when the MP4 contains actual generated temporal motion. If inference fails because of hardware, memory or model download issues, the job becomes `failed`; do not replace it with a fake animation.
+
+For image-to-video, upload a reference frame and describe the physical movement you expect. The image is passed into LTX as conditioning at frame 0.
+
+## Queue safety
+
+- queued jobs are claimed with compare-and-set
+- two workers cannot intentionally claim the same queued row
+- queued jobs can be cancelled before a worker claims them
+- processing jobs are not automatically requeued after a crash
+- completed videos are private and exposed through short-lived signed URLs
+- old failed provider rows remain historical only; NovaFrame no longer calls those providers
